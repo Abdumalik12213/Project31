@@ -1,0 +1,751 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+import sqlite3
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+import json
+import os
+from PIL import Image, ImageTk
+import io
+import threading
+import time
+import re
+import csv
+import webbrowser
+import logging
+import urllib3
+from dataclasses import dataclass
+from typing import Optional
+
+# Отключаем предупреждения о SSL
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('price_monitor.log'),
+        logging.StreamHandler()
+    ]
+)
+
+@dataclass
+class Product:
+    """Класс для хранения данных о товаре"""
+    id: int
+    name: str
+    url: str
+    current_price: Optional[float]
+    previous_price: Optional[float]
+    currency: str
+    last_updated: str
+    selector_path: str
+    image_data: Optional[bytes] = None
+    category: str = "Без категории"
+
+class PriceMonitorApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("💰 Price Monitor")
+        self.root.geometry("1200x700")
+        
+        # Центрирование окна
+        self.center_window()
+        
+        # Подключение к базе данных
+        self.conn = None
+        self.create_database()
+        
+        self.current_product_id = None
+        self.update_thread = None
+        self.stop_update = False
+        
+        # Конфигурация
+        self.config = self.load_config()
+        
+        # Создание интерфейса
+        self.create_widgets()
+        
+        # Загрузка данных
+        self.load_products()
+        
+        # Запуск автообновления
+        if self.config.get('auto_update', False):
+            self.start_auto_update()
+    
+    def center_window(self):
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width - 1200) // 2
+        y = (screen_height - 700) // 2
+        self.root.geometry(f'1200x700+{x}+{y}')
+    
+    def create_database(self):
+        try:
+            self.conn = sqlite3.connect('price_monitor.db', check_same_thread=False)
+            cursor = self.conn.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS products (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    category TEXT DEFAULT 'Без категории',
+                    image_data BLOB,
+                    current_price REAL,
+                    previous_price REAL,
+                    currency TEXT DEFAULT 'RUB',
+                    last_updated TEXT,
+                    selector_path TEXT,
+                    target_price REAL,
+                    is_active INTEGER DEFAULT 1
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS price_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_id INTEGER,
+                    price REAL NOT NULL,
+                    date TEXT NOT NULL,
+                    FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            ''')
+            
+            self.conn.commit()
+            
+        except sqlite3.Error as e:
+            logging.error(f"Ошибка создания базы данных: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось создать базу данных:\n{e}")
+    
+    def load_config(self):
+        config = {
+            'update_interval': 300,
+            'auto_update': False,
+            'notifications': True,
+            'currency': 'RUB'
+        }
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT key, value FROM settings")
+            for key, value in cursor.fetchall():
+                if key in config:
+                    if key == 'update_interval':
+                        config[key] = int(value)
+                    elif key in ['auto_update', 'notifications']:
+                        config[key] = bool(int(value))
+                    else:
+                        config[key] = value
+        except Exception as e:
+            logging.error(f"Ошибка загрузки конфигурации: {e}")
+        
+        return config
+    
+    def save_config(self):
+        try:
+            cursor = self.conn.cursor()
+            for key, value in self.config.items():
+                if isinstance(value, bool):
+                    value = int(value)
+                cursor.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (key, str(value))
+                )
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка сохранения конфигурации: {e}")
+    
+    def create_widgets(self):
+        # Главное меню
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Файл", menu=file_menu)
+        file_menu.add_command(label="Экспорт в CSV", command=self.export_data)
+        file_menu.add_separator()
+        file_menu.add_command(label="Выход", command=self.on_closing)
+        
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Инструменты", menu=tools_menu)
+        tools_menu.add_command(label="Статистика", command=self.show_statistics)
+        tools_menu.add_command(label="Настройки", command=self.show_settings)
+        
+        # Основной контейнер
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Левая панель - управление
+        left_frame = ttk.LabelFrame(main_frame, text="Управление", padding="10")
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        
+        # Форма добавления
+        ttk.Label(left_frame, text="Название:").pack(anchor=tk.W)
+        self.name_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.name_var, width=30).pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(left_frame, text="URL:").pack(anchor=tk.W)
+        self.url_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.url_var, width=30).pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(left_frame, text="Категория:").pack(anchor=tk.W)
+        self.category_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.category_var, width=30).pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(left_frame, text="CSS-селектор цены:").pack(anchor=tk.W)
+        self.selector_var = tk.StringVar(value=".price, .product-price")
+        ttk.Entry(left_frame, textvariable=self.selector_var, width=30).pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(left_frame, text="Целевая цена:").pack(anchor=tk.W)
+        self.target_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=self.target_var, width=30).pack(fill=tk.X, pady=(0, 10))
+        
+        btn_frame = ttk.Frame(left_frame)
+        btn_frame.pack(fill=tk.X)
+        
+        ttk.Button(btn_frame, text="Добавить", command=self.add_product).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Обновить", command=self.update_product).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Очистить", command=self.clear_form).pack(side=tk.LEFT, padx=2)
+        
+        ttk.Separator(left_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
+        
+        # Кнопки мониторинга
+        ttk.Button(left_frame, text="Обновить все цены", 
+                  command=self.update_all_prices).pack(fill=tk.X, pady=2)
+        ttk.Button(left_frame, text="Обновить выбранное", 
+                  command=self.update_selected_price).pack(fill=tk.X, pady=2)
+        
+        self.auto_var = tk.BooleanVar(value=self.config['auto_update'])
+        ttk.Checkbutton(left_frame, text="Автообновление", 
+                       variable=self.auto_var,
+                       command=self.toggle_auto_update).pack(anchor=tk.W, pady=5)
+        
+        # Информация
+        self.info_text = scrolledtext.ScrolledText(left_frame, height=10, width=35)
+        self.info_text.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.info_text.config(state=tk.DISABLED)
+        
+        # Правая панель - таблица товаров
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Поиск
+        search_frame = ttk.Frame(right_frame)
+        search_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(search_frame, text="Поиск:").pack(side=tk.LEFT)
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', lambda *args: self.load_products())
+        ttk.Entry(search_frame, textvariable=self.search_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        
+        # Таблица
+        columns = ("ID", "Название", "Категория", "Цена", "Изменение", "Обновлено")
+        self.tree = ttk.Treeview(right_frame, columns=columns, show="headings", height=20)
+        
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=100)
+        
+        self.tree.column("Название", width=200)
+        self.tree.column("ID", width=50)
+        
+        scrollbar = ttk.Scrollbar(right_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # События
+        self.tree.bind('<<TreeviewSelect>>', self.on_product_select)
+        self.tree.bind('<Double-1>', lambda e: self.open_in_browser())
+        self.tree.bind('<Button-3>', self.show_context_menu)
+        
+        # Контекстное меню
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Копировать URL", command=self.copy_url)
+        self.context_menu.add_command(label="Открыть в браузере", command=self.open_in_browser)
+        self.context_menu.add_command(label="Обновить цену", command=self.update_selected_price)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Удалить", command=self.delete_product)
+        
+        # Статус бар
+        self.status_bar = ttk.Label(self.root, text="Готов к работе", relief=tk.SUNKEN)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+    
+    def get_categories(self):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT DISTINCT category FROM products WHERE category != ''")
+            return ["Все товары"] + [row[0] for row in cursor.fetchall()]
+        except:
+            return ["Все товары"]
+    
+    def load_products(self):
+        try:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            
+            query = "SELECT id, name, category, current_price, previous_price, last_updated FROM products WHERE is_active = 1"
+            params = []
+            
+            search = self.search_var.get().strip()
+            if search:
+                query += " AND (name LIKE ? OR category LIKE ?)"
+                params.extend([f"%{search}%", f"%{search}%"])
+            
+            query += " ORDER BY last_updated DESC"
+            
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            
+            for row in cursor.fetchall():
+                product_id, name, category, current_price, previous_price, last_updated = row
+                
+                change_text = "—"
+                if current_price and previous_price:
+                    diff = current_price - previous_price
+                    if diff > 0:
+                        change_text = f"▲ +{diff:.2f}"
+                    elif diff < 0:
+                        change_text = f"▼ {diff:.2f}"
+                
+                price_text = f"{current_price:.2f} ₽" if current_price else "—"
+                
+                self.tree.insert("", tk.END, values=(
+                    product_id, name, category, price_text, change_text, last_updated
+                ))
+            
+            self.status_bar.config(text=f"Загружено товаров: {len(self.tree.get_children())}")
+            
+        except Exception as e:
+            logging.error(f"Ошибка загрузки: {e}")
+    
+    def on_product_select(self, event):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        item = self.tree.item(selection[0])
+        product_id = item['values'][0]
+        self.current_product_id = product_id
+        
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT name, url, category, selector_path, target_price
+                FROM products WHERE id = ?
+            """, (product_id,))
+            
+            name, url, category, selector, target = cursor.fetchone()
+            
+            self.name_var.set(name)
+            self.url_var.set(url)
+            self.category_var.set(category)
+            self.selector_var.set(selector)
+            self.target_var.set(str(target) if target else "")
+            
+            info = f"Выбран: {name}\nКатегория: {category}\nURL: {url[:50]}..."
+            self.info_text.config(state=tk.NORMAL)
+            self.info_text.delete(1.0, tk.END)
+            self.info_text.insert(1.0, info)
+            self.info_text.config(state=tk.DISABLED)
+            
+        except Exception as e:
+            logging.error(f"Ошибка загрузки деталей: {e}")
+    
+    def show_context_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.context_menu.post(event.x_root, event.y_root)
+    
+    def add_product(self):
+        name = self.name_var.get().strip()
+        url = self.url_var.get().strip()
+        
+        if not name or not url:
+            messagebox.showwarning("Ошибка", "Заполните название и URL")
+            return
+        
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        
+        try:
+            target = float(self.target_var.get()) if self.target_var.get() else None
+        except ValueError:
+            messagebox.showwarning("Ошибка", "Некорректная целевая цена")
+            return
+        
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            INSERT INTO products (name, url, category, selector_path, target_price, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            name,
+            url,
+            self.category_var.get() or "Без категории",
+            self.selector_var.get() or ".price",
+            target,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ))
+        
+        self.conn.commit()
+        self.load_products()
+        self.clear_form()
+        self.status_bar.config(text=f"Товар '{name}' добавлен")
+    
+    def update_product(self):
+        if not self.current_product_id:
+            messagebox.showwarning("Ошибка", "Выберите товар")
+            return
+        
+        try:
+            target = float(self.target_var.get()) if self.target_var.get() else None
+        except ValueError:
+            messagebox.showwarning("Ошибка", "Некорректная целевая цена")
+            return
+        
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            UPDATE products SET name=?, url=?, category=?, selector_path=?, target_price=?
+            WHERE id=?
+        """, (
+            self.name_var.get(),
+            self.url_var.get(),
+            self.category_var.get() or "Без категории",
+            self.selector_var.get(),
+            target,
+            self.current_product_id
+        ))
+        
+        self.conn.commit()
+        self.load_products()
+        self.status_bar.config(text="Товар обновлен")
+    
+    def clear_form(self):
+        self.name_var.set("")
+        self.url_var.set("")
+        self.category_var.set("")
+        self.selector_var.set(".price")
+        self.target_var.set("")
+        self.current_product_id = None
+        
+        self.info_text.config(state=tk.NORMAL)
+        self.info_text.delete(1.0, tk.END)
+        self.info_text.config(state=tk.DISABLED)
+    
+    def delete_product(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        if messagebox.askyesno("Подтверждение", "Удалить товар?"):
+            item = self.tree.item(selection[0])
+            product_id = item['values'][0]
+            
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM products WHERE id=?", (product_id,))
+            self.conn.commit()
+            
+            self.load_products()
+            self.clear_form()
+            self.status_bar.config(text="Товар удален")
+    
+    def copy_url(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        item = self.tree.item(selection[0])
+        product_id = item['values'][0]
+        
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT url FROM products WHERE id=?", (product_id,))
+        url = cursor.fetchone()[0]
+        
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self.status_bar.config(text="URL скопирован")
+    
+    def open_in_browser(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        item = self.tree.item(selection[0])
+        product_id = item['values'][0]
+        
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT url FROM products WHERE id=?", (product_id,))
+        url = cursor.fetchone()[0]
+        
+        webbrowser.open(url)
+    
+    def extract_price(self, html, selector):
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            for sel in selector.split(','):
+                sel = sel.strip()
+                elements = soup.select(sel)
+                if elements:
+                    text = elements[0].get_text().strip()
+                    # Ищем цену в тексте
+                    numbers = re.findall(r'[\d\s,.]*\d+[.,]?\d*', text)
+                    if numbers:
+                        price_str = numbers[0].replace(' ', '').replace(',', '.')
+                        return float(price_str)
+            
+            return None
+        except:
+            return None
+    
+    def update_product_price(self, product_id, force=False):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT url, selector_path, current_price, name 
+                FROM products WHERE id=? AND is_active=1
+            """, (product_id,))
+            
+            url, selector, current_price, name = cursor.fetchone()
+            
+            if not force:
+                cursor.execute("SELECT last_updated FROM products WHERE id=?", (product_id,))
+                last = cursor.fetchone()[0]
+                if last:
+                    try:
+                        last_date = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                        if datetime.now() - last_date < timedelta(minutes=5):
+                            return True
+                    except:
+                        pass
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=15, verify=False)
+            new_price = self.extract_price(response.text, selector)
+            
+            if new_price:
+                cursor.execute("""
+                    UPDATE products 
+                    SET previous_price=?, current_price=?, last_updated=?
+                    WHERE id=?
+                """, (current_price, new_price, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), product_id))
+                
+                cursor.execute("""
+                    INSERT INTO price_history (product_id, price, date)
+                    VALUES (?, ?, ?)
+                """, (product_id, new_price, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                
+                self.conn.commit()
+                
+                # Проверка целевой цены
+                cursor.execute("SELECT target_price FROM products WHERE id=?", (product_id,))
+                target = cursor.fetchone()[0]
+                if target and new_price <= target:
+                    self.show_notification("Цель достигнута!", f"{name}\nЦена: {new_price:.2f} ₽")
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logging.error(f"Ошибка обновления: {e}")
+            return False
+    
+    def update_selected_price(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Ошибка", "Выберите товар")
+            return
+        
+        item = self.tree.item(selection[0])
+        product_id = item['values'][0]
+        
+        self.status_bar.config(text="Обновление...")
+        self.root.update()
+        
+        if self.update_product_price(product_id, force=True):
+            self.load_products()
+            self.status_bar.config(text="Цена обновлена")
+        else:
+            self.status_bar.config(text="Ошибка обновления")
+    
+    def update_all_prices(self):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, name FROM products WHERE is_active=1")
+        products = cursor.fetchall()
+        
+        if not products:
+            messagebox.showinfo("Информация", "Нет товаров для обновления")
+            return
+        
+        def update():
+            success = 0
+            for product_id, name in products:
+                if self.update_product_price(product_id):
+                    success += 1
+                time.sleep(2)
+            
+            self.root.after(0, lambda: self.load_products())
+            self.root.after(0, lambda: self.status_bar.config(
+                text=f"Обновлено {success} из {len(products)}"
+            ))
+        
+        threading.Thread(target=update, daemon=True).start()
+    
+    def toggle_auto_update(self):
+        self.config['auto_update'] = self.auto_var.get()
+        self.save_config()
+        
+        if self.config['auto_update']:
+            self.start_auto_update()
+        else:
+            self.stop_auto_update()
+    
+    def start_auto_update(self):
+        if self.update_thread and self.update_thread.is_alive():
+            return
+        
+        self.stop_update = False
+        
+        def loop():
+            while self.config['auto_update'] and not self.stop_update:
+                time.sleep(self.config['update_interval'])
+                if self.config['auto_update'] and not self.stop_update:
+                    self.root.after(0, self.update_all_prices)
+        
+        self.update_thread = threading.Thread(target=loop, daemon=True)
+        self.update_thread.start()
+        self.status_bar.config(text="Автообновление запущено")
+    
+    def stop_auto_update(self):
+        self.stop_update = True
+        self.status_bar.config(text="Автообновление остановлено")
+    
+    def show_statistics(self):
+        cursor = self.conn.cursor()
+        
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(current_price) as with_price,
+                AVG(current_price) as avg_price,
+                MIN(current_price) as min_price,
+                MAX(current_price) as max_price
+            FROM products WHERE is_active=1
+        """)
+        
+        stats = cursor.fetchone()
+        
+        msg = f"""📊 Статистика:
+        
+Всего товаров: {stats[0]}
+С ценами: {stats[1]}
+Без цен: {stats[0] - stats[1]}
+
+Средняя цена: {stats[2]:.2f} ₽
+Минимальная: {stats[3]:.2f} ₽
+Максимальная: {stats[4]:.2f} ₽"""
+        
+        messagebox.showinfo("Статистика", msg)
+    
+    def show_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title("Настройки")
+        win.geometry("400x300")
+        
+        ttk.Label(win, text="Интервал обновления (мин):").pack(pady=5)
+        interval_var = tk.StringVar(value=str(self.config['update_interval'] // 60))
+        ttk.Entry(win, textvariable=interval_var).pack()
+        
+        ttk.Label(win, text="Валюта:").pack(pady=5)
+        currency_var = tk.StringVar(value=self.config['currency'])
+        ttk.Combobox(win, textvariable=currency_var, 
+                    values=['RUB', 'USD', 'EUR']).pack()
+        
+        notif_var = tk.BooleanVar(value=self.config['notifications'])
+        ttk.Checkbutton(win, text="Уведомления", variable=notif_var).pack(pady=5)
+        
+        def save():
+            try:
+                self.config['update_interval'] = int(interval_var.get()) * 60
+                self.config['currency'] = currency_var.get()
+                self.config['notifications'] = notif_var.get()
+                self.save_config()
+                win.destroy()
+                messagebox.showinfo("Успех", "Настройки сохранены")
+            except:
+                messagebox.showerror("Ошибка", "Некорректный интервал")
+        
+        ttk.Button(win, text="Сохранить", command=save).pack(pady=20)
+    
+    def export_data(self):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT name, category, url, current_price, previous_price, last_updated
+            FROM products WHERE is_active=1
+        """)
+        
+        data = cursor.fetchall()
+        
+        if not data:
+            messagebox.showinfo("Экспорт", "Нет данных для экспорта")
+            return
+        
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")]
+        )
+        
+        if filename:
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Название', 'Категория', 'URL', 'Текущая цена', 'Предыдущая цена', 'Обновлено'])
+                writer.writerows(data)
+            
+            self.status_bar.config(text=f"Экспортировано в {os.path.basename(filename)}")
+    
+    def show_notification(self, title, msg):
+        if not self.config['notifications']:
+            return
+        
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("300x150")
+        win.attributes('-topmost', True)
+        
+        ttk.Label(win, text="🔔", font=('Arial', 24)).pack(pady=10)
+        ttk.Label(win, text=msg).pack(pady=10)
+        ttk.Button(win, text="OK", command=win.destroy).pack(pady=10)
+        
+        self.root.after(5000, win.destroy)
+    
+    def on_closing(self):
+        self.stop_auto_update()
+        if self.conn:
+            self.conn.close()
+        self.root.destroy()
+
+def main():
+    root = tk.Tk()
+    app = PriceMonitorApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
